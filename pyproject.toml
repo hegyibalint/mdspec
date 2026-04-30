@@ -1,0 +1,17 @@
+[project]
+name = "mdspec"
+version = "0.1.0"
+description = "Render Markdown specs to printable PDFs via Typst."
+requires-python = ">=3.10"
+dependencies = [
+    "mistune==3.2.0",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+]
+
+[project.scripts]
+mdspec = "mdspec:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

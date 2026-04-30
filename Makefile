@@ -1,20 +1,23 @@
-SOURCE ?= specs/Remove Implicit Parent Project Property Lookup - GBT Spec.md
 BUILD_DIR := build
-TYP := $(BUILD_DIR)/spec.typ
-PDF := $(BUILD_DIR)/spec.pdf
-.PHONY: pdf preview clean
+SPEC_SRC := specs/Remove Implicit Parent Project Property Lookup - GBT Spec.md
+SPEC_PDF := $(BUILD_DIR)/spec.pdf
+TAKEAWAYS_SRC := specs/Remove Implicit Parent Project Property Lookup - Show & Tell Takeaways.md
+TAKEAWAYS_PDF := $(BUILD_DIR)/takeaways.pdf
 
-pdf: $(PDF)
+.PHONY: pdf spec takeaways preview clean
 
-$(PDF): $(TYP)
-	typst compile $(TYP) $(PDF)
+pdf: spec takeaways
 
-$(TYP): scripts/md_to_typst.py
+spec:
 	mkdir -p $(BUILD_DIR)
-	.venv/bin/python scripts/md_to_typst.py "$(SOURCE)" --output "$(TYP)"
+	mdspec convert "$(SPEC_SRC)" -o "$(SPEC_PDF)"
 
-preview: $(PDF)
-	pdftoppm -f 1 -l 1 -png -r 160 -singlefile $(PDF) $(BUILD_DIR)/page-1
+takeaways:
+	mkdir -p $(BUILD_DIR)
+	mdspec convert "$(TAKEAWAYS_SRC)" -o "$(TAKEAWAYS_PDF)"
+
+preview: spec
+	pdftoppm -f 1 -l 1 -png -r 160 -singlefile $(SPEC_PDF) $(BUILD_DIR)/page-1
 
 clean:
 	rm -rf $(BUILD_DIR)

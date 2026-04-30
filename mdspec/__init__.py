@@ -2,12 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 import mistune
+
+
+def cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return Path(base) / "mdspec"
 
 
 @dataclass
@@ -27,13 +36,36 @@ class Block:
     header: list[list[Inline]] = field(default_factory=list)
     code: str = ""
     language: str = ""
+    label: str = ""
+    emit_reference: bool = True
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render a GBT Markdown spec to printable Typst.")
-    parser.add_argument("source", type=Path)
-    parser.add_argument("--output", "-o", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Render a Markdown spec to a printable PDF via Typst.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    auth = subparsers.add_parser("auth", help="Run the Google OAuth consent flow and cache the token")
+    auth.add_argument(
+        "--credentials",
+        type=Path,
+        help="OAuth client secrets JSON (default: $MDSPEC_GOOGLE_CREDENTIALS or ~/.gt-headroom-mcp/gcp-oauth.keys.json)",
+    )
+    auth.add_argument("--force", action="store_true", help="Re-authenticate even if a valid token exists")
+
+    convert = subparsers.add_parser("convert", help="Convert a Google Doc URL or local Markdown file to PDF")
+    convert.add_argument("source", help="Google Doc URL/id or local Markdown file path")
+    convert.add_argument(
+        "--credentials",
+        type=Path,
+        help="OAuth client secrets JSON (default: $MDSPEC_GOOGLE_CREDENTIALS or ~/.gt-headroom-mcp/gcp-oauth.keys.json)",
+    )
+    convert.add_argument("-o", "--output", type=Path, help="Output PDF path (default: <snake-cased-title>.pdf in CWD)")
+
     return parser.parse_args()
+
+
+def snake_case(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
 
 
 def parse_markdown(text: str) -> list[dict]:
@@ -60,7 +92,9 @@ def ast_inlines_to_ir(nodes: list[dict]) -> list[Inline]:
         elif kind in {"strong", "emphasis", "strikethrough", "superscript", "subscript", "span"}:
             result.extend(ast_inlines_to_ir(node.get("children", [])))
         elif kind == "link":
-            result.extend(ast_inlines_to_ir(node.get("children", [])))
+            link_text = text_of(ast_inlines_to_ir(node.get("children", [])))
+            if link_text:
+                result.append(Inline("link", link_text))
         elif kind in {"softbreak", "linebreak"}:
             result.append(Inline("text", " "))
         elif kind == "blank_line":
@@ -110,7 +144,9 @@ def ast_blocks_to_ir(nodes: list[dict]) -> list[Block]:
         elif kind == "block_text":
             blocks.append(Block("paragraph", inlines=ast_inlines_to_ir(node.get("children", []))))
         elif kind == "list":
-            blocks.append(list_to_ir(node))
+            list_block = list_to_ir(node)
+            if list_block.children:
+                blocks.append(list_block)
         elif kind == "block_code":
             attrs = node.get("attrs") or {}
             blocks.append(Block("code", code=clean_code(node.get("raw", "")), language=attrs.get("info", "")))
@@ -132,7 +168,8 @@ def list_to_ir(node: dict) -> Block:
     items: list[Block] = []
     for item in node.get("children", []):
         item_blocks = ast_blocks_to_ir(item.get("children", []))
-        items.append(Block("list_item", children=item_blocks))
+        if item_blocks:
+            items.append(Block("list_item", children=item_blocks))
     return Block("list", children=items, ordered=bool(attrs.get("ordered")))
 
 
@@ -158,35 +195,151 @@ def clean_code(code: str) -> str:
 
 def normalize_document(blocks: list[Block]) -> list[Block]:
     normalized: list[Block] = []
-    seen_h1: set[str] = set()
+    previous_heading: tuple[int, str] | None = None
+    skipped_heading_level: int | None = None
 
     for block in blocks:
         if block.kind == "horizontal_rule":
             continue
 
-        if block.kind == "heading" and block.level == 1:
-            heading_text = text_of(block.inlines)
-            if heading_text in seen_h1:
+        if skipped_heading_level is not None:
+            if block.kind == "heading" and (block.level or 1) <= skipped_heading_level:
+                skipped_heading_level = None
+            else:
                 continue
-            seen_h1.add(heading_text)
 
         if block.kind == "heading":
             block.inlines = clean_heading_inlines(block.inlines)
-            if not text_of(block.inlines).strip() or text_of(block.inlines).strip() == "---":
+            heading_text = normalize_text(text_of(block.inlines))
+            heading_key = (block.level or 1, heading_text)
+            if not heading_text or heading_text == "---":
+                previous_heading = None
                 continue
+            if previous_heading == heading_key:
+                continue
+            if is_ignored_print_section(block):
+                skipped_heading_level = block.level or 1
+                previous_heading = None
+                continue
+            previous_heading = heading_key
+        else:
+            previous_heading = None
 
         if block.kind == "table" and is_review_table(block):
             continue
 
         if block.kind in {"paragraph", "heading"}:
-            block.inlines = remove_reference_parentheticals(block.inlines)
+            block.inlines = drop_link_only_parentheticals(block.inlines)
 
         if block.kind == "list":
             block = normalize_list(block)
 
         normalized.append(block)
 
+    label_floats(normalized)
+    normalized = split_embedded_floats(normalized)
+    attach_float_references(normalized)
     return normalized
+
+
+def is_ignored_print_section(block: Block) -> bool:
+    if block.kind != "heading" or block.level != 1:
+        return False
+    return normalize_text(text_of(block.inlines)).casefold() == "notes"
+
+
+def attach_float_references(blocks: list[Block]) -> None:
+    previous_text_block: Block | None = None
+    for block in blocks:
+        if block.kind in {"paragraph", "list"}:
+            previous_text_block = block
+            continue
+
+        if block.kind in {"code", "table"} and block.emit_reference and previous_text_block:
+            if attach_float_reference([previous_text_block], block):
+                block.emit_reference = False
+            continue
+
+        if block.kind == "heading":
+            previous_text_block = None
+
+
+def split_embedded_floats(blocks: list[Block]) -> list[Block]:
+    result: list[Block] = []
+    for block in blocks:
+        if block.kind == "list":
+            result.extend(split_list_at_floats(block))
+        else:
+            result.append(block)
+    return result
+
+
+def split_list_at_floats(block: Block) -> list[Block]:
+    result: list[Block] = []
+    current_items: list[Block] = []
+
+    def flush_items() -> None:
+        nonlocal current_items
+        if current_items:
+            result.append(Block("list", children=current_items, ordered=block.ordered))
+            current_items = []
+
+    for item in block.children:
+        kept_children: list[Block] = []
+        floats: list[Block] = []
+        for child in split_embedded_floats(item.children):
+            if child.kind in {"code", "table"}:
+                if attach_float_reference(kept_children, child):
+                    child.emit_reference = False
+                floats.append(child)
+            else:
+                kept_children.append(child)
+
+        current_items.append(Block("list_item", children=kept_children))
+        if floats:
+            flush_items()
+            result.extend(floats)
+
+    flush_items()
+    return result
+
+
+def attach_float_reference(blocks: list[Block], floating: Block) -> bool:
+    if not blocks:
+        return False
+
+    reference = Inline("text", " " + float_reference_text(floating.label or fallback_float_label(floating)))
+    target = blocks[-1]
+    if target.kind == "paragraph":
+        target.inlines = compact_inlines([*target.inlines, reference])
+        return True
+    if target.kind == "list":
+        for item in reversed(target.children):
+            if attach_float_reference(item.children, floating):
+                return True
+    return False
+
+
+def label_floats(blocks: list[Block]) -> None:
+    counters = {"code": 0, "table": 0}
+
+    def visit(items: list[Block]) -> None:
+        for item in items:
+            if item.kind == "code":
+                counters["code"] += 1
+                item.label = f"Listing {counters['code']}"
+            elif item.kind == "table":
+                counters["table"] += 1
+                item.label = f"Table {counters['table']}"
+            elif item.kind == "list":
+                for child in item.children:
+                    visit(child.children)
+
+    visit(blocks)
+
+
+def fallback_float_label(block: Block) -> str:
+    return "Listing" if block.kind == "code" else "Table"
 
 
 def normalize_list(block: Block) -> Block:
@@ -194,7 +347,7 @@ def normalize_list(block: Block) -> Block:
         normalized_children: list[Block] = []
         for child in item.children:
             if child.kind == "paragraph":
-                child.inlines = remove_reference_parentheticals(child.inlines)
+                child.inlines = drop_link_only_parentheticals(child.inlines)
             elif child.kind == "list":
                 child = normalize_list(child)
             normalized_children.append(child)
@@ -216,7 +369,7 @@ def is_review_table(block: Block) -> bool:
     return "Reviewed" in header and "Approved" in header and "Needs changes" in header
 
 
-def remove_reference_parentheticals(inlines: list[Inline]) -> list[Inline]:
+def drop_link_only_parentheticals(inlines: list[Inline]) -> list[Inline]:
     out: list[Inline] = []
     i = 0
     while i < len(inlines):
@@ -304,6 +457,8 @@ def render_inlines(inlines: list[Inline]) -> str:
     for inline in inlines:
         if inline.kind == "code":
             parts.append(f"#raw({typst_string(inline.text)})")
+        elif inline.kind == "link":
+            parts.append(f"#underline[{escape_typst_text(inline.text)}]")
         else:
             parts.append(escape_typst_text(inline.text))
     return "".join(parts)
@@ -330,19 +485,16 @@ def render_block(block: Block) -> str:
     if block.kind == "table":
         return render_table(block)
     if block.kind == "code":
-        return f"#code-block({typst_string(block.code)})"
+        label = block.label or "Listing"
+        reference = f"{render_float_reference(label)}\n\n" if block.emit_reference else ""
+        return f"{reference}#code-block({typst_string(block.code)}, caption: {typst_string(label + '.')})"
     return ""
 
 
 def render_list(block: Block) -> str:
-    marker = "+" if block.ordered else "-"
-    lines: list[str] = []
-    for item in block.children:
-        item_lines = render_list_item(item).splitlines() or [""]
-        lines.append(f"{marker} {item_lines[0]}")
-        for continuation in item_lines[1:]:
-            lines.append(f"  {continuation}")
-    return "\n".join(lines)
+    function = "enum" if block.ordered else "list"
+    items = ",\n".join(render_list_item(item) for item in block.children)
+    return f"#{function}(\n{items},\n)"
 
 
 def render_list_item(item: Block) -> str:
@@ -351,17 +503,39 @@ def render_list_item(item: Block) -> str:
         rendered_child = render_block(child)
         if rendered_child:
             rendered.append(rendered_child)
-    return "\n".join(rendered)
+    body = "\n\n".join(rendered)
+    return "[\n" + body + "\n]"
 
 
 def render_table(block: Block) -> str:
-    rows = [block.header] + block.rows
+    rows = [block.header] + block.rows if block.header else block.rows
+    rendered_header = "(" + ", ".join(f"[{render_inlines(cell)}]" for cell in block.header) + ")"
     rendered_rows = [
         "(" + ", ".join(f"[{render_inlines(cell)}]" for cell in row) + ")"
-        for row in rows
+        for row in block.rows
     ]
     column_count = max((len(row) for row in rows), default=0)
-    return "#wide-table(\n" + f"  columns: {column_count},\n" + "  rows: (\n    " + ",\n    ".join(rendered_rows) + ",\n  ),\n)"
+    label = block.label or "Table"
+    reference = f"{render_float_reference(label)}\n\n" if block.emit_reference else ""
+    return (
+        reference
+        +
+        "#wide-table(\n"
+        + f"  columns: {column_count},\n"
+        + f"  caption: {typst_string(label + '.')},\n"
+        + f"  header: {rendered_header},\n"
+        + "  rows: (\n    "
+        + ",\n    ".join(rendered_rows)
+        + ",\n  ),\n)"
+    )
+
+
+def render_float_reference(label: str) -> str:
+    return escape_typst_text(float_reference_text(label))
+
+
+def float_reference_text(label: str) -> str:
+    return f"See {label}."
 
 
 def write_template(path: Path) -> None:
@@ -370,7 +544,7 @@ def write_template(path: Path) -> None:
   set document(title: title)
   set page(
     paper: "a4",
-    margin: (x: 8mm, y: 9mm),
+    margin: (inside: 18mm, outside: 7mm, y: 9mm),
     columns: 2,
     numbering: "1",
   )
@@ -382,19 +556,19 @@ def write_template(path: Path) -> None:
 
   show raw.where(block: false): set text(font: "Fira Code", size: 0.78em)
 
-  show heading.where(level: 1): it => block(above: 11pt, below: 6pt, breakable: false)[
+  show heading.where(level: 1): it => block(above: 11pt, below: 8pt, breakable: false)[
     #set text(size: 15pt, weight: "bold")
     #it
   ]
-  show heading.where(level: 2): it => block(above: 9pt, below: 4.5pt, breakable: false)[
+  show heading.where(level: 2): it => block(above: 9pt, below: 6pt, breakable: false)[
     #set text(size: 11.2pt, weight: "bold")
     #it
   ]
-  show heading.where(level: 3): it => block(above: 7pt, below: 3.5pt, breakable: false)[
+  show heading.where(level: 3): it => block(above: 7pt, below: 4.8pt, breakable: false)[
     #set text(size: 9.5pt, weight: "bold")
     #it
   ]
-  show heading.where(level: 4): it => block(above: 6pt, below: 3pt, breakable: false)[
+  show heading.where(level: 4): it => block(above: 6pt, below: 4pt, breakable: false)[
     #set text(size: 8.8pt, weight: "bold")
     #it
   ]
@@ -402,35 +576,75 @@ def write_template(path: Path) -> None:
   body
 }
 
-#let code-block(source) = place(
-  top,
+#let float-caption(caption) = if caption != none {
+  block(width: 100%, above: 2.6pt, below: 0pt, breakable: false)[
+    #set text(size: 6.2pt, style: "italic")
+    #caption
+  ]
+}
+
+#let code-block(source, caption: none) = place(
+  auto,
   float: true,
   scope: "parent",
+  clearance: 5pt,
   block(
     width: 100%,
-    fill: luma(245),
-    stroke: (left: 1.5pt + black),
-    inset: (x: 7pt, y: 6pt),
-    radius: 1pt,
     breakable: false,
   )[
-    #set text(font: "Fira Code", size: 6.8pt)
-    #raw(source, block: true)
+    #align(left)[
+      #block(
+        width: 100%,
+        fill: luma(245),
+        stroke: (left: 1.5pt + black),
+        inset: (x: 7pt, y: 6pt),
+        radius: 1pt,
+        breakable: false,
+      )[
+        #set text(font: "Fira Code", size: 6.8pt)
+        #raw(source, block: true)
+      ]
+      #float-caption(caption)
+    ]
   ],
 )
 
-#let wide-table(columns: 0, rows: ()) = place(
-  top,
+#let wide-table(columns: 0, caption: none, header: (), rows: ()) = place(
+  auto,
   float: true,
   scope: "parent",
-  block(width: 100%)[
-    #set text(size: if columns >= 5 { 5.7pt } else { 6.8pt })
-    #table(
-      columns: columns,
-      inset: (x: 2.8pt, y: 1.7pt),
-      stroke: none,
-      ..rows.flatten()
-    )
+  clearance: 5pt,
+  block(width: 100%, above: 3pt, below: 5pt, breakable: false)[
+    #align(left)[
+      #set text(size: if columns >= 5 { 5.7pt } else { 6.4pt })
+      #set par(justify: false, leading: 0.48em, spacing: 0pt)
+      #let column-widths = if columns == 3 {
+        (1.05fr, 1.55fr, 1.4fr)
+      } else {
+        columns
+      }
+      #table(
+        columns: column-widths,
+        inset: (x: 3.6pt, y: 3.2pt),
+        stroke: (x, y) => if y == 0 {
+          none
+        } else if y == 1 {
+          (bottom: 0.75pt + black)
+        } else {
+          (bottom: 0.25pt + luma(205))
+        },
+        fill: (x, y) => if y == 0 {
+          luma(232)
+        } else if calc.rem(y, 2) == 0 {
+          luma(248)
+        } else {
+          none
+        },
+        table.header(repeat: true, ..header.map(cell => strong(cell))),
+        ..rows.flatten()
+      )
+      #float-caption(caption)
+    ]
   ],
 )
 """,
@@ -440,14 +654,57 @@ def write_template(path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    source = args.source.read_text(encoding="utf-8")
+    if args.command == "auth":
+        cmd_auth(args)
+    elif args.command == "convert":
+        cmd_convert(args)
+
+
+def cmd_auth(args: argparse.Namespace) -> None:
+    from mdspec.google import credentials_path, run_consent, token_path
+
+    creds_file = credentials_path(args.credentials)
+    run_consent(creds_file, force=args.force)
+    print(f"authenticated; token cached at {token_path()}")
+
+
+def cmd_convert(args: argparse.Namespace) -> None:
+    if shutil.which("typst") is None:
+        sys.exit("error: `typst` not found on PATH; install it from https://github.com/typst/typst")
+
+    src = args.source
+    src_path = Path(src)
+    if src_path.is_file():
+        source = src_path.read_text(encoding="utf-8")
+        stem = src_path.stem
+        title_fallback = src_path
+    else:
+        from mdspec.google import credentials_path, fetch_doc_with_comments
+
+        creds_file = credentials_path(args.credentials)
+        doc_id, drive_name, source = fetch_doc_with_comments(src, creds_file)
+        stem = doc_id
+        title_fallback = Path(drive_name)
+
     ast = parse_markdown(source)
     blocks = normalize_document(ast_blocks_to_ir(ast))
-    title = document_title(blocks, args.source)
+    title = document_title(blocks, title_fallback)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    write_template(args.output.parent / "template.typ")
-    args.output.write_text(render_typst(blocks, title), encoding="utf-8")
+    if args.output:
+        output_pdf = args.output
+    else:
+        slug = snake_case(title) or stem
+        output_pdf = Path.cwd() / f"{slug}.pdf"
+
+    cache = cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    typ_file = cache / f"{stem}.typ"
+    write_template(cache / "template.typ")
+    typ_file.write_text(render_typst(blocks, title), encoding="utf-8")
+
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["typst", "compile", str(typ_file), str(output_pdf)], check=True)
+    print(f"wrote {output_pdf}")
 
 
 def document_title(blocks: list[Block], source: Path) -> str:
