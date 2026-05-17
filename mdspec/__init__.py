@@ -89,7 +89,11 @@ def ast_inlines_to_ir(nodes: list[dict]) -> list[Inline]:
             result.append(Inline("text", node.get("raw", "")))
         elif kind == "codespan":
             result.append(Inline("code", normalize_text(node.get("raw", ""))))
-        elif kind in {"strong", "emphasis", "strikethrough", "superscript", "subscript", "span"}:
+        elif kind in {"strong", "emphasis"}:
+            inner_text = text_of(ast_inlines_to_ir(node.get("children", [])))
+            if inner_text:
+                result.append(Inline(kind, inner_text))
+        elif kind in {"strikethrough", "superscript", "subscript", "span"}:
             result.extend(ast_inlines_to_ir(node.get("children", [])))
         elif kind == "link":
             link_text = text_of(ast_inlines_to_ir(node.get("children", [])))
@@ -149,9 +153,17 @@ def ast_blocks_to_ir(nodes: list[dict]) -> list[Block]:
                 blocks.append(list_block)
         elif kind == "block_code":
             attrs = node.get("attrs") or {}
-            blocks.append(Block("code", code=clean_code(node.get("raw", "")), language=attrs.get("info", "")))
+            info = (attrs.get("info") or "").strip()
+            if info == "typst":
+                blocks.append(Block("typst_raw", code=node.get("raw", "")))
+            else:
+                blocks.append(Block("code", code=clean_code(node.get("raw", "")), language=info))
         elif kind == "table":
             blocks.append(table_to_ir(node))
+        elif kind == "block_quote":
+            inner = ast_blocks_to_ir(node.get("children", []))
+            if inner:
+                blocks.append(Block("block_quote", children=inner))
         elif kind == "thematic_break":
             blocks.append(Block("horizontal_rule"))
         elif kind in {"block_html", "raw_html"}:
@@ -444,6 +456,7 @@ def escape_typst_text(text: str) -> str:
         "@": "\\@",
         "*": "\\*",
         "`": "\\`",
+        "/": "\\/",
     }
     return "".join(replacements.get(char, char) for char in text)
 
@@ -452,21 +465,39 @@ def typst_string(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
 
+_INLINE_TYPST_RE = re.compile(r"\{\{mdspec-typst:([^{}]+)\}\}")
+
+
+def render_text(text: str) -> str:
+    parts: list[str] = []
+    previous_end = 0
+    for match in _INLINE_TYPST_RE.finditer(text):
+        parts.append(escape_typst_text(text[previous_end:match.start()]))
+        parts.append(match.group(1))
+        previous_end = match.end()
+    parts.append(escape_typst_text(text[previous_end:]))
+    return "".join(parts)
+
+
 def render_inlines(inlines: list[Inline]) -> str:
     parts: list[str] = []
     for inline in inlines:
         if inline.kind == "code":
             parts.append(f"#raw({typst_string(inline.text)})")
         elif inline.kind == "link":
-            parts.append(f"#underline[{escape_typst_text(inline.text)}]")
+            parts.append(f"#underline[{render_text(inline.text)}]")
+        elif inline.kind == "strong":
+            parts.append(f"#strong[{render_text(inline.text)}]")
+        elif inline.kind == "emphasis":
+            parts.append(f"#emph[{render_text(inline.text)}]")
         else:
-            parts.append(escape_typst_text(inline.text))
+            parts.append(render_text(inline.text))
     return "".join(parts)
 
 
 def render_typst(blocks: list[Block], title: str) -> str:
     body = "\n\n".join(render_block(block) for block in blocks)
-    return f"""#import \"template.typ\": doc, wide-table, code-block
+    return f"""#import \"template.typ\": doc, wide-table, code-block, float-ref
 
 #show: doc.with(title: {typst_string(title)})
 
@@ -475,6 +506,12 @@ def render_typst(blocks: list[Block], title: str) -> str:
 
 
 def render_block(block: Block) -> str:
+    if block.kind == "typst_raw":
+        return block.code
+    if block.kind == "block_quote":
+        inner_parts = [render_block(child) for child in block.children]
+        inner = "\n\n".join(part for part in inner_parts if part)
+        return f"#pad(left: 14pt)[\n{inner}\n]"
     if block.kind == "heading":
         level = "=" * min(block.level or 1, 5)
         return f"{level} {render_inlines(block.inlines)}"
@@ -487,7 +524,7 @@ def render_block(block: Block) -> str:
     if block.kind == "code":
         label = block.label or "Listing"
         reference = f"{render_float_reference(label)}\n\n" if block.emit_reference else ""
-        return f"{reference}#code-block({typst_string(block.code)}, caption: {typst_string(label + '.')})"
+        return f"{reference}#code-block({typst_string(block.code)}, caption: {typst_string(label + '.')}, target: {typst_float_label(label)})"
     return ""
 
 
@@ -523,6 +560,7 @@ def render_table(block: Block) -> str:
         "#wide-table(\n"
         + f"  columns: {column_count},\n"
         + f"  caption: {typst_string(label + '.')},\n"
+        + f"  target: {typst_float_label(label)},\n"
         + f"  header: {rendered_header},\n"
         + "  rows: (\n    "
         + ",\n    ".join(rendered_rows)
@@ -531,11 +569,15 @@ def render_table(block: Block) -> str:
 
 
 def render_float_reference(label: str) -> str:
-    return escape_typst_text(float_reference_text(label))
+    return f"#float-ref({typst_float_label(label)}, [{escape_typst_text(label)}])"
 
 
 def float_reference_text(label: str) -> str:
-    return f"See {label}."
+    return f"{{{{mdspec-typst:{render_float_reference(label)}}}}}"
+
+
+def typst_float_label(label: str) -> str:
+    return f"<mdspec-float-{snake_case(label).replace('_', '-')}>"
 
 
 def write_template(path: Path) -> None:
@@ -547,6 +589,7 @@ def write_template(path: Path) -> None:
     margin: (inside: 18mm, outside: 7mm, y: 9mm),
     columns: 2,
     numbering: "1",
+    supplement: "p.",
   )
   set text(font: "Libertinus Serif", size: 8.35pt)
   set par(justify: false, leading: 0.52em, spacing: 0.62em)
@@ -583,7 +626,13 @@ def write_template(path: Path) -> None:
   ]
 }
 
-#let code-block(source, caption: none) = place(
+#let float-ref(target, name) = context {
+  let here-page = counter(page).at(here()).first()
+  let target-page = counter(page).at(target).first()
+  emph(if here-page == target-page [See #name.] else [See #name on page #target-page.])
+}
+
+#let code-block(source, caption: none, target: none) = place(
   auto,
   float: true,
   scope: "parent",
@@ -592,6 +641,7 @@ def write_template(path: Path) -> None:
     width: 100%,
     breakable: false,
   )[
+    #metadata(none) #target
     #align(left)[
       #block(
         width: 100%,
@@ -609,12 +659,13 @@ def write_template(path: Path) -> None:
   ],
 )
 
-#let wide-table(columns: 0, caption: none, header: (), rows: ()) = place(
+#let wide-table(columns: 0, caption: none, target: none, header: (), rows: ()) = place(
   auto,
   float: true,
   scope: "parent",
   clearance: 5pt,
   block(width: 100%, above: 3pt, below: 5pt, breakable: false)[
+    #metadata(none) #target
     #align(left)[
       #set text(size: if columns >= 5 { 5.7pt } else { 6.4pt })
       #set par(justify: false, leading: 0.48em, spacing: 0pt)

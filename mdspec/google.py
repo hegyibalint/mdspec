@@ -81,16 +81,60 @@ def run_consent(credentials_file: Path, force: bool = False):
     return creds
 
 
-def get_drive_service(credentials_file: Path):
+def build_services(creds):
     from googleapiclient.discovery import build
 
-    creds = run_consent(credentials_file)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    docs = build("docs", "v1", credentials=creds, cache_discovery=False)
+    return drive, docs
 
 
 def export_markdown(service, doc_id: str) -> str:
     data: bytes = service.files().export(fileId=doc_id, mimeType="text/markdown").execute()
     return data.decode("utf-8")
+
+
+def list_tabs(docs_service, doc_id: str) -> list[dict]:
+    """Return a flat list of tabs in display order: [{id, title, depth}, ...]."""
+    doc = docs_service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
+
+    def walk(tabs: list[dict], depth: int, out: list[dict]) -> None:
+        for tab in tabs:
+            props = tab.get("tabProperties") or {}
+            tab_id = props.get("tabId")
+            if tab_id:
+                out.append({"id": tab_id, "title": props.get("title", ""), "depth": depth})
+            walk(tab.get("childTabs") or [], depth + 1, out)
+
+    out: list[dict] = []
+    walk(doc.get("tabs") or [], 0, out)
+    return out
+
+
+def export_tab_markdown(creds, doc_id: str, tab_id: str) -> str:
+    """Fetch a single tab's markdown via the docs.google.com export endpoint.
+
+    The Drive API `files.export` ignores tab parameters and returns all tabs
+    concatenated; the user-facing export URL accepts `?tab=<tabId>` and is the
+    only way to get per-tab markdown today.
+    """
+    from google.auth.transport.requests import AuthorizedSession
+
+    session = AuthorizedSession(creds)
+    url = f"https://docs.google.com/document/d/{doc_id}/export?format=md&tab={tab_id}"
+    response = session.get(url)
+    response.raise_for_status()
+    return response.text
+
+
+def assemble_tab_markdown(creds, doc_id: str, tabs: list[dict]) -> str:
+    parts: list[str] = []
+    for tab in tabs:
+        title = tab["title"].strip() or tab["id"]
+        heading = "#" * min(tab["depth"] + 1, 6)
+        body = export_tab_markdown(creds, doc_id, tab["id"]).lstrip()
+        parts.append(f"{heading} {title}\n\n{body.rstrip()}")
+    return "\n\n".join(parts) + "\n"
 
 
 def fetch_comments(service, doc_id: str) -> list[dict]:
@@ -116,11 +160,12 @@ def fetch_comments(service, doc_id: str) -> list[dict]:
 
 
 def insert_references(markdown: str, comments: list[dict]) -> str:
+    comments = [comment for comment in comments if not comment.get("resolved", False)]
     if not comments:
         return markdown
 
     body = markdown
-    references: list[str] = []
+    threads: list[str] = []
 
     for index, comment in enumerate(comments, start=1):
         quoted = (comment.get("quotedFileContent") or {}).get("value", "")
@@ -128,61 +173,126 @@ def insert_references(markdown: str, comments: list[dict]) -> str:
         if quoted:
             position = body.find(quoted)
             if position != -1:
-                end = position + len(quoted)
-                body = body[:end] + f" \\[{index}\\]" + body[end:]
+                end = _shift_past_code_context(body, position, position + len(quoted))
+                label = _comment_body_label(index)
+                body = body[:end] + f" \\[{index}\\]{{{{mdspec-typst:#metadata(none) <{label}>}}}}" + body[end:]
                 anchored = True
             else:
                 print(
                     f"warning: comment [{index}] anchor not found in markdown export",
                     file=sys.stderr,
                 )
-        references.append(_format_reference(index, comment, anchored))
+        threads.append(_format_thread_md(index, comment, anchored))
 
-    if not references:
+    if not threads:
         return body
 
-    return body.rstrip() + "\n\n# References\n\n" + "\n\n".join(references) + "\n"
+    return body.rstrip() + "\n\n# Comments\n\n" + "\n\n".join(threads) + "\n"
 
 
-def _format_reference(num: int, comment: dict, anchored: bool) -> str:
+def _format_thread_md(num: int, comment: dict, anchored: bool) -> str:
     author = (comment.get("author") or {}).get("displayName", "Unknown")
-    created = comment.get("createdTime", "")
-    content = (comment.get("content") or "").strip()
+    body_text = (comment.get("content") or "").strip()
     quoted = (comment.get("quotedFileContent") or {}).get("value", "").strip()
+    if len(quoted) > 240:
+        quoted = quoted[:237] + "..."
     resolved = bool(comment.get("resolved", False))
 
-    lines: list[str] = [f"## [{num}]"]
-    if quoted:
-        excerpt = quoted if len(quoted) <= 240 else quoted[:237] + "..."
-        lines.append(f"> {excerpt}")
-        lines.append("")
-    status = []
+    attribution_parts: list[str] = [author]
     if resolved:
-        status.append("resolved")
+        attribution_parts.append("resolved")
     if not anchored and quoted:
-        status.append("anchor not found")
-    suffix = f" — {', '.join(status)}" if status else ""
-    lines.append(f"**{author}** ({created}){suffix}")
-    lines.append("")
-    lines.append(content or "_(no body)_")
+        attribution_parts.append("anchor not found")
 
+    heading_number = str(num)
+    if anchored:
+        heading_number += f", {{{{mdspec-typst:#ref(<{_comment_body_label(num)}>, form: \"page\")}}}}"
+
+    out: list[str] = [f"## [{heading_number}] {' · '.join(attribution_parts)}"]
+    if quoted:
+        out.append("")
+        out.append(f"*“{quoted}”*")
+
+    inner: list[str] = []
+    if body_text:
+        inner.append(body_text)
+
+    valid_replies: list[tuple[str, str]] = []
     for reply in comment.get("replies") or []:
-        rauthor = (reply.get("author") or {}).get("displayName", "Unknown")
-        rcreated = reply.get("createdTime", "")
         rbody = (reply.get("content") or "").strip()
-        lines.append("")
-        lines.append(f"**{rauthor}** ({rcreated})")
-        lines.append("")
-        lines.append(rbody or "_(no body)_")
+        if not rbody:
+            continue
+        rauthor = (reply.get("author") or {}).get("displayName", "Unknown")
+        valid_replies.append((rauthor, rbody))
 
-    return "\n".join(lines)
+    if valid_replies:
+        if inner:
+            inner.append("")
+        for i, (rauthor, rbody) in enumerate(valid_replies):
+            if i > 0:
+                inner.append(">")
+            inner.append(f"> *{rauthor}*")
+            inner.append(">")
+            for line in rbody.splitlines():
+                inner.append(f"> {line}")
+
+    if inner:
+        out.append("")
+        for line in inner:
+            out.append(">" if line == "" else f"> {line}")
+
+    return "\n".join(out)
+
+
+def _comment_body_label(num: int) -> str:
+    return f"mdspec-comment-body-{num}"
+
+
+_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})", re.MULTILINE)
+
+
+def _shift_past_code_context(body: str, start: int, end: int) -> int:
+    """If [start, end) lands inside a fenced or inline code block, return a
+    position just after the enclosing block; otherwise return end unchanged."""
+    fence_open: Optional[re.Match[str]] = None
+    fence_marker: Optional[str] = None
+    for match in _FENCE_RE.finditer(body):
+        if match.start() >= start:
+            break
+        marker = match.group(1)[0]
+        if fence_open is None:
+            fence_open = match
+            fence_marker = marker
+        elif marker == fence_marker:
+            fence_open = None
+            fence_marker = None
+    if fence_open is not None and fence_marker is not None:
+        close_re = re.compile(rf"^[ \t]*{re.escape(fence_marker)}{{3,}}[ \t]*$", re.MULTILINE)
+        close = close_re.search(body, fence_open.end())
+        if close and close.start() > start:
+            newline = body.find("\n", close.end())
+            return newline + 1 if newline != -1 else len(body)
+
+    line_start = body.rfind("\n", 0, start) + 1
+    if body.count("`", line_start, start) % 2 == 1:
+        close = body.find("`", end)
+        if close != -1:
+            return close + 1
+    return end
 
 
 def fetch_doc_with_comments(spec: str, credentials_file: Path) -> tuple[str, str, str]:
     doc_id = parse_doc_id(spec)
-    service = get_drive_service(credentials_file)
-    meta = service.files().get(fileId=doc_id, fields="name").execute()
+    creds = run_consent(credentials_file)
+    drive, docs = build_services(creds)
+    meta = drive.files().get(fileId=doc_id, fields="name", supportsAllDrives=True).execute()
     drive_name = meta.get("name", doc_id)
-    markdown = export_markdown(service, doc_id)
-    comments = fetch_comments(service, doc_id)
+
+    tabs = list_tabs(docs, doc_id)
+    if len(tabs) > 1:
+        markdown = assemble_tab_markdown(creds, doc_id, tabs)
+    else:
+        markdown = export_markdown(drive, doc_id)
+
+    comments = fetch_comments(drive, doc_id)
     return doc_id, drive_name, insert_references(markdown, comments)
