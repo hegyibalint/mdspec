@@ -9,8 +9,6 @@ from typing import Optional
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-DEFAULT_CREDENTIALS_PATH = Path.home() / ".gt-headroom-mcp" / "gcp-oauth.keys.json"
-
 _DOC_ID_PATTERNS = [
     re.compile(r"/document/d/([a-zA-Z0-9_-]+)"),
     re.compile(r"/d/([a-zA-Z0-9_-]+)"),
@@ -30,13 +28,14 @@ def parse_doc_id(spec: str) -> str:
     raise ValueError(f"could not extract a Google Doc id from {spec!r}")
 
 
-def credentials_path(override: Optional[Path] = None) -> Path:
+def config_path(override: Optional[Path] = None) -> Path:
     if override:
         return override.expanduser()
-    env = os.environ.get("MDSPEC_GOOGLE_CREDENTIALS")
+    env = os.environ.get("MDSPEC_CONFIG")
     if env:
         return Path(env).expanduser()
-    return DEFAULT_CREDENTIALS_PATH
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "mdspec" / "config.toml"
 
 
 def token_path() -> Path:
@@ -44,7 +43,37 @@ def token_path() -> Path:
     return Path(base) / "mdspec" / "google-token.json"
 
 
-def run_consent(credentials_file: Path, force: bool = False):
+def _google_client_config(config_file: Path) -> dict:
+    import tomllib
+
+    if not config_file.exists():
+        sys.exit(
+            f"error: mdspec config not found at {config_file}\n"
+            f"create it with:\n\n"
+            f"  [google]\n"
+            f"  client_id = \"<your-oauth-client-id>\"\n"
+            f"  client_secret = \"<your-oauth-client-secret>\"\n"
+        )
+    with config_file.open("rb") as fh:
+        config = tomllib.load(fh)
+    google = config.get("google") or {}
+    client_id = google.get("client_id")
+    client_secret = google.get("client_secret")
+    if not client_id or not client_secret:
+        sys.exit(f"error: [google] client_id / client_secret missing in {config_file}")
+    return {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+
+
+def run_consent(config_file: Path, force: bool = False):
     """Load (or obtain) Google credentials, refreshing or running consent as needed."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -68,12 +97,8 @@ def run_consent(credentials_file: Path, force: bool = False):
             creds = None
 
     if force or not creds or not creds.valid:
-        if not credentials_file.exists():
-            sys.exit(
-                f"error: OAuth client config not found at {credentials_file}\n"
-                f"set MDSPEC_GOOGLE_CREDENTIALS or pass --credentials"
-            )
-        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
+        client_config = _google_client_config(config_file)
+        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
         creds = flow.run_local_server(port=0)
         tok_path.parent.mkdir(parents=True, exist_ok=True)
         tok_path.write_text(creds.to_json(), encoding="utf-8")
@@ -281,9 +306,9 @@ def _shift_past_code_context(body: str, start: int, end: int) -> int:
     return end
 
 
-def fetch_doc_with_comments(spec: str, credentials_file: Path) -> tuple[str, str, str]:
+def fetch_doc_with_comments(spec: str, config_file: Path) -> tuple[str, str, str]:
     doc_id = parse_doc_id(spec)
-    creds = run_consent(credentials_file)
+    creds = run_consent(config_file)
     drive, docs = build_services(creds)
     meta = drive.files().get(fileId=doc_id, fields="name", supportsAllDrives=True).execute()
     drive_name = meta.get("name", doc_id)

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Render Markdown specs to printable PDFs via Typst."
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "mistune==3.2.0",
     "google-api-python-client>=2.100",

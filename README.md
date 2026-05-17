@@ -18,7 +18,7 @@ quote, and multi-tab docs render each tab as its own top-level section.
 ## Install
 
 You'll need [Typst](https://github.com/typst/typst) on your `PATH` and Python
-3.10+. Then:
+3.11+. Then:
 
 ```sh
 uv tool install git+https://github.com/hegyibalint/mdspec
@@ -45,17 +45,25 @@ The PDF lands in the current directory, named after the document's title. Use
 
 ### Google authentication
 
-First-time Google Doc conversion runs the OAuth consent flow in a browser; the
-token is cached under `~/.cache/mdspec/`. You can also run it explicitly:
+To convert Google Docs, mdspec needs an OAuth client (type **Desktop**) from a
+Google Cloud project with the Drive and Docs APIs enabled. Drop the client ID
+and secret into `~/.config/mdspec/config.toml`:
+
+```toml
+[google]
+client_id = "..."
+client_secret = "..."
+```
+
+(Override the path with `--config path/to/config.toml` or `$MDSPEC_CONFIG`.)
+
+The first Google Doc conversion runs the OAuth consent flow in a browser; the
+resulting token is cached under `~/.cache/mdspec/`. You can also kick it off
+explicitly:
 
 ```sh
 mdspec auth
 ```
-
-You need an OAuth client config (a `gcp-oauth.keys.json` from a Google Cloud
-project with the Drive and Docs APIs enabled). By default mdspec looks at
-`~/.gt-headroom-mcp/gcp-oauth.keys.json`; override with
-`--credentials path/to/keys.json` or the `MDSPEC_GOOGLE_CREDENTIALS` env var.
 
 ## License
 

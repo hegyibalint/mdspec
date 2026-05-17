@@ -46,18 +46,18 @@ def parse_args() -> argparse.Namespace:
 
     auth = subparsers.add_parser("auth", help="Run the Google OAuth consent flow and cache the token")
     auth.add_argument(
-        "--credentials",
+        "--config",
         type=Path,
-        help="OAuth client secrets JSON (default: $MDSPEC_GOOGLE_CREDENTIALS or ~/.gt-headroom-mcp/gcp-oauth.keys.json)",
+        help="mdspec config TOML (default: $MDSPEC_CONFIG or $XDG_CONFIG_HOME/mdspec/config.toml)",
     )
     auth.add_argument("--force", action="store_true", help="Re-authenticate even if a valid token exists")
 
     convert = subparsers.add_parser("convert", help="Convert a Google Doc URL or local Markdown file to PDF")
     convert.add_argument("source", help="Google Doc URL/id or local Markdown file path")
     convert.add_argument(
-        "--credentials",
+        "--config",
         type=Path,
-        help="OAuth client secrets JSON (default: $MDSPEC_GOOGLE_CREDENTIALS or ~/.gt-headroom-mcp/gcp-oauth.keys.json)",
+        help="mdspec config TOML (default: $MDSPEC_CONFIG or $XDG_CONFIG_HOME/mdspec/config.toml)",
     )
     convert.add_argument("-o", "--output", type=Path, help="Output PDF path (default: <snake-cased-title>.pdf in CWD)")
 
@@ -712,10 +712,10 @@ def main() -> None:
 
 
 def cmd_auth(args: argparse.Namespace) -> None:
-    from mdspec.google import credentials_path, run_consent, token_path
+    from mdspec.google import config_path, run_consent, token_path
 
-    creds_file = credentials_path(args.credentials)
-    run_consent(creds_file, force=args.force)
+    config_file = config_path(args.config)
+    run_consent(config_file, force=args.force)
     print(f"authenticated; token cached at {token_path()}")
 
 
@@ -730,10 +730,10 @@ def cmd_convert(args: argparse.Namespace) -> None:
         stem = src_path.stem
         title_fallback = src_path
     else:
-        from mdspec.google import credentials_path, fetch_doc_with_comments
+        from mdspec.google import config_path, fetch_doc_with_comments
 
-        creds_file = credentials_path(args.credentials)
-        doc_id, drive_name, source = fetch_doc_with_comments(src, creds_file)
+        config_file = config_path(args.config)
+        doc_id, drive_name, source = fetch_doc_with_comments(src, config_file)
         stem = doc_id
         title_fallback = Path(drive_name)
 
