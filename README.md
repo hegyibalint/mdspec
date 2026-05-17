@@ -1,13 +1,19 @@
 # mdspec
 
-Render Markdown specs — local files or Google Docs — to printable two-column
-PDFs via [Typst](https://typst.app).
+Compress long Markdown specs and Google Docs into tight, two-column
+scientific-paper-style PDFs that are actually pleasant to print and read on
+paper, via [Typst](https://typst.app).
 
-Input is a Markdown file or a Google Doc URL. Output is a PDF tuned for reading
-on paper: two columns, dense type, code listings and tables placed as floats
-with cross-references back to the text. For Google Docs, comment threads are
-pulled in as numbered references with page links to the anchored quote, and
-multi-tab docs render each tab as its own top-level section.
+A sprawling design doc that runs 30 screens in the browser typically collapses
+to a handful of A4 pages: dense type, two columns, code listings and tables
+floated with cross-references back to the text — the same conventions academic
+papers use to fit a lot of content into a small page budget without feeling
+cramped. The intent is to turn a hard-to-skim long document into something you
+can mark up with a pen.
+
+Input is a Markdown file or a Google Doc URL. For Google Docs, comment threads
+are pulled in as numbered references with page links back to the anchored
+quote, and multi-tab docs render each tab as its own top-level section.
 
 ## Install
 
