@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import os
 import re
 import shutil
@@ -23,6 +25,7 @@ def cache_dir() -> Path:
 class Inline:
     kind: str
     text: str
+    url: str = ""
 
 
 @dataclass
@@ -99,6 +102,11 @@ def ast_inlines_to_ir(nodes: list[dict]) -> list[Inline]:
             link_text = text_of(ast_inlines_to_ir(node.get("children", [])))
             if link_text:
                 result.append(Inline("link", link_text))
+        elif kind == "image":
+            url = (node.get("attrs") or {}).get("url", "")
+            if url:
+                alt = text_of(ast_inlines_to_ir(node.get("children", [])))
+                result.append(Inline("image", alt, url=url))
         elif kind in {"softbreak", "linebreak"}:
             result.append(Inline("text", " "))
         elif kind == "blank_line":
@@ -115,6 +123,9 @@ def ast_inlines_to_ir(nodes: list[dict]) -> list[Inline]:
 def compact_inlines(inlines: list[Inline]) -> list[Inline]:
     compacted: list[Inline] = []
     for inline in inlines:
+        if inline.kind == "image":
+            compacted.append(inline)
+            continue
         text = re.sub(r"\s+", " ", inline.text)
         if not text:
             continue
@@ -132,7 +143,7 @@ def compact_inlines(inlines: list[Inline]) -> list[Inline]:
         next_inline = compacted[index + 1]
         if inline.kind == "code" and next_inline.kind == "text" and not next_inline.text.startswith((" ", ".", ",", ":", ";", ")", "]")):
             next_inline.text = " " + next_inline.text
-    return [inline for inline in compacted if inline.text]
+    return [inline for inline in compacted if inline.kind == "image" or inline.text]
 
 
 def ast_blocks_to_ir(nodes: list[dict]) -> list[Block]:
@@ -144,9 +155,9 @@ def ast_blocks_to_ir(nodes: list[dict]) -> list[Block]:
         if kind == "heading":
             blocks.append(Block("heading", level=node["attrs"]["level"], inlines=ast_inlines_to_ir(node["children"])))
         elif kind == "paragraph":
-            blocks.append(Block("paragraph", inlines=ast_inlines_to_ir(node.get("children", []))))
+            blocks.extend(split_paragraph_at_images(ast_inlines_to_ir(node.get("children", []))))
         elif kind == "block_text":
-            blocks.append(Block("paragraph", inlines=ast_inlines_to_ir(node.get("children", []))))
+            blocks.extend(split_paragraph_at_images(ast_inlines_to_ir(node.get("children", []))))
         elif kind == "list":
             list_block = list_to_ir(node)
             if list_block.children:
@@ -173,6 +184,32 @@ def ast_blocks_to_ir(nodes: list[dict]) -> list[Block]:
             if children:
                 blocks.extend(ast_blocks_to_ir(children))
     return blocks
+
+
+def split_paragraph_at_images(inlines: list[Inline]) -> list[Block]:
+    """Promote each image inline to its own paragraph block.
+
+    Google Docs exports images on their own line inside a soft-broken paragraph;
+    mistune keeps them inline. Rendering them at text height makes them unreadable,
+    so we lift each image out and emit text-before, image, text-after as separate
+    paragraphs.
+    """
+    blocks: list[Block] = []
+    buffer: list[Inline] = []
+
+    def flush_text() -> None:
+        if buffer:
+            blocks.append(Block("paragraph", inlines=compact_inlines(buffer)))
+            buffer.clear()
+
+    for inline in inlines:
+        if inline.kind == "image":
+            flush_text()
+            blocks.append(Block("paragraph", inlines=[inline]))
+        else:
+            buffer.append(inline)
+    flush_text()
+    return [block for block in blocks if block.inlines]
 
 
 def list_to_ir(node: dict) -> Block:
@@ -490,12 +527,85 @@ def render_inlines(inlines: list[Inline]) -> str:
             parts.append(f"#strong[{render_text(inline.text)}]")
         elif inline.kind == "emphasis":
             parts.append(f"#emph[{render_text(inline.text)}]")
+        elif inline.kind == "image":
+            if inline.url:
+                parts.append(f"#box(image({typst_string(inline.url)}, height: 1.6em))")
+            elif inline.text:
+                parts.append(render_text(inline.text))
         else:
             parts.append(render_text(inline.text))
     return "".join(parts)
 
 
+_DATA_URL_RE = re.compile(r"^data:image/([a-z0-9+]+)((?:;[^,]+)*),(.+)$", re.DOTALL | re.IGNORECASE)
+
+
+def materialize_images(blocks: list[Block], target_dir: Path) -> None:
+    for block in blocks:
+        for inline in block.inlines:
+            materialize_image_inline(inline, target_dir)
+        for cell in block.header:
+            for inline in cell:
+                materialize_image_inline(inline, target_dir)
+        for row in block.rows:
+            for cell in row:
+                for inline in cell:
+                    materialize_image_inline(inline, target_dir)
+        if block.children:
+            materialize_images(block.children, target_dir)
+
+
+def materialize_image_inline(inline: Inline, target_dir: Path) -> None:
+    if inline.kind != "image" or not inline.url:
+        return
+    match = _DATA_URL_RE.match(inline.url)
+    if not match:
+        # External URL or non-image data URL; we can't fetch, drop the ref.
+        inline.url = ""
+        return
+    ext = match.group(1).lower()
+    params = match.group(2)
+    payload = match.group(3)
+    if ";base64" not in params.lower():
+        # Google Docs always exports as base64; bail rather than guess encodings.
+        inline.url = ""
+        return
+    try:
+        data = base64.b64decode(payload, validate=False)
+    except Exception:
+        inline.url = ""
+        return
+    if ext == "jpeg":
+        ext = "jpg"
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    filename = f"image-{digest}.{ext}"
+    filepath = target_dir / filename
+    if not filepath.exists():
+        filepath.write_bytes(data)
+    inline.url = filename
+
+
+def drop_title_heading(blocks: list[Block], title: str) -> list[Block]:
+    """Drop the first level-1 heading matching the title; the template renders
+    it as a full-width banner above the columns, so leaving it in the body
+    would duplicate it."""
+    result: list[Block] = []
+    dropped = False
+    for block in blocks:
+        if (
+            not dropped
+            and block.kind == "heading"
+            and block.level == 1
+            and text_of(block.inlines).strip() == title
+        ):
+            dropped = True
+            continue
+        result.append(block)
+    return result
+
+
 def render_typst(blocks: list[Block], title: str) -> str:
+    blocks = drop_title_heading(blocks, title)
     body = "\n\n".join(render_block(block) for block in blocks)
     return f"""#import \"template.typ\": doc, wide-table, code-block, float-ref
 
@@ -516,6 +626,13 @@ def render_block(block: Block) -> str:
         level = "=" * min(block.level or 1, 5)
         return f"{level} {render_inlines(block.inlines)}"
     if block.kind == "paragraph":
+        if (
+            len(block.inlines) == 1
+            and block.inlines[0].kind == "image"
+            and block.inlines[0].url
+        ):
+            url = block.inlines[0].url
+            return f"#align(center)[#image({typst_string(url)}, width: 95%)]"
         return render_inlines(block.inlines)
     if block.kind == "list":
         return render_list(block)
@@ -544,11 +661,26 @@ def render_list_item(item: Block) -> str:
     return "[\n" + body + "\n]"
 
 
+def typst_array(elements: list[str], indent: str | None = None) -> str:
+    """Render a list of already-rendered elements as a Typst array literal.
+
+    A trailing comma is always emitted for non-empty arrays: Typst reads `(x)`
+    as the value `x`, and only `(x,)` as a one-element array, so a single cell
+    or row would otherwise collapse to a bare value. An empty list becomes `()`
+    rather than `(,)`, which is a syntax error.
+    """
+    if not elements:
+        return "()"
+    if indent is None:
+        return "(" + ", ".join(elements) + ",)"
+    return "(\n" + indent + (",\n" + indent).join(elements) + ",\n  )"
+
+
 def render_table(block: Block) -> str:
     rows = [block.header] + block.rows if block.header else block.rows
-    rendered_header = "(" + ", ".join(f"[{render_inlines(cell)}]" for cell in block.header) + ")"
+    rendered_header = typst_array([f"[{render_inlines(cell)}]" for cell in block.header])
     rendered_rows = [
-        "(" + ", ".join(f"[{render_inlines(cell)}]" for cell in row) + ")"
+        typst_array([f"[{render_inlines(cell)}]" for cell in row])
         for row in block.rows
     ]
     column_count = max((len(row) for row in rows), default=0)
@@ -556,15 +688,12 @@ def render_table(block: Block) -> str:
     reference = f"{render_float_reference(label)}\n\n" if block.emit_reference else ""
     return (
         reference
-        +
-        "#wide-table(\n"
+        + "#wide-table(\n"
         + f"  columns: {column_count},\n"
         + f"  caption: {typst_string(label + '.')},\n"
         + f"  target: {typst_float_label(label)},\n"
         + f"  header: {rendered_header},\n"
-        + "  rows: (\n    "
-        + ",\n    ".join(rendered_rows)
-        + ",\n  ),\n)"
+        + f"  rows: {typst_array(rendered_rows, indent='    ')},\n)"
     )
 
 
@@ -616,6 +745,16 @@ def write_template(path: Path) -> None:
     #it
   ]
 
+  // Render the title as the first parent-scoped top float. Because floats stack
+  // in source order, emitting it before the body guarantees it wins the top
+  // slot, spanning both columns -- no table/callout/listing can rise above it.
+  if title != none {
+    place(top, scope: "parent", float: true, clearance: 9pt, block(width: 100%, breakable: false)[
+      #set text(size: 16pt, weight: "bold")
+      #title
+    ])
+  }
+
   body
 }
 
@@ -632,8 +771,10 @@ def write_template(path: Path) -> None:
   emph(if here-page == target-page [See #name.] else [See #name on page #target-page.])
 }
 
-#let code-block(source, caption: none, target: none) = place(
-  auto,
+#let code-block(source, caption: none, target: none) = context place(
+  // Page 1 leads with the title, so sink its floats to the bottom; later pages
+  // keep auto placement (Typst picks top/bottom by fit).
+  if here().page() == 1 { bottom } else { auto },
   float: true,
   scope: "parent",
   clearance: 5pt,
@@ -659,8 +800,8 @@ def write_template(path: Path) -> None:
   ],
 )
 
-#let wide-table(columns: 0, caption: none, target: none, header: (), rows: ()) = place(
-  auto,
+#let wide-table(columns: 0, caption: none, target: none, header: (), rows: ()) = context place(
+  if here().page() == 1 { bottom } else { auto },
   float: true,
   scope: "parent",
   clearance: 5pt,
@@ -737,8 +878,12 @@ def cmd_convert(args: argparse.Namespace) -> None:
         stem = doc_id
         title_fallback = Path(drive_name)
 
+    cache = cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+
     ast = parse_markdown(source)
     blocks = normalize_document(ast_blocks_to_ir(ast))
+    materialize_images(blocks, cache)
     title = document_title(blocks, title_fallback)
 
     if args.output:
@@ -747,8 +892,6 @@ def cmd_convert(args: argparse.Namespace) -> None:
         slug = snake_case(title) or stem
         output_pdf = Path.cwd() / f"{slug}.pdf"
 
-    cache = cache_dir()
-    cache.mkdir(parents=True, exist_ok=True)
     typ_file = cache / f"{stem}.typ"
     write_template(cache / "template.typ")
     typ_file.write_text(render_typst(blocks, title), encoding="utf-8")
